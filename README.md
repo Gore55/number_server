@@ -1,7 +1,7 @@
 To test with executable (better performance):
 
-Open terminal window:\n
-  cd ~/number_server\n
+Open terminal window:
+  cd ~/number_server
   cargo build --release
   ./target/release/number_server
 
