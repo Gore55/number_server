@@ -1,14 +1,12 @@
-#![allow(dead_code, unused)]
-
 use std::sync::Arc;
 use std::collections::HashSet;
 use tokio::fs::OpenOptions;
-use tokio::sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender}};
+// use tokio::sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender}};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use std::sync::Mutex;
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncBufReadExt, Lines, BufReader, BufWriter, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, BufReader, BufWriter, AsyncWriteExt};
 use std::net::{Ipv4Addr, SocketAddrV4};
-
-const CERO: &str = "0";
 
 pub struct AppStatus {
     total_unique: usize,
@@ -41,7 +39,7 @@ impl AppStatus {
         self.n_new_unique = 0;
     }
     fn status_print(&mut self) {
-        println!("Received {}, {} duplicates. Unique total: {}", self.n_new_unique, self.n_duplicates, self.total_unique);
+        println!("Received {} numbers - {} uniques | {} duplicates. Total: {} | {} clients connected", self.n_new_unique + self.n_duplicates, self.n_new_unique, self.n_duplicates, self.total_unique, self.n_clients);
         self.cero_();
     }
 }
@@ -54,38 +52,23 @@ enum PossibleOutcome {
 
 
 fn process_line(line: &str) -> PossibleOutcome {
-
     match line {
-
         "terminate" => return PossibleOutcome::Terminate,
-
         _ => {
-
-            if line.len() == 9 {
-
-                let mut stripped = String::from(line);                               
-                while stripped.starts_with(CERO) { stripped.remove(0); };
-                
-                if let Ok(number) = stripped.parse::<u32>() {
-                    
+            if line.len() <= 9 {
+                if let Ok(number) = line.parse::<u32>() {
                     return PossibleOutcome::Okay(number)
-                    
-                } else {
-                    
+                } else {     
                     return PossibleOutcome::Bad
-
                 };
-
             } else {
-
                 return PossibleOutcome::Bad
-
             }
         }
     }
 }
 
-pub async fn start_listening(status: Arc<Mutex<AppStatus>>, tx: UnboundedSender<u32>, port: u16)  -> Result<(), Box<dyn std::error::Error>>{
+pub async fn start_listening(status: Arc<Mutex<AppStatus>>, tx: UnboundedSender<String>, port: u16)  -> Result<(), Box<dyn std::error::Error>>{
     
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port)).await?;
     println!("Now listening at: {}", listener.local_addr()?);
@@ -94,24 +77,20 @@ pub async fn start_listening(status: Arc<Mutex<AppStatus>>, tx: UnboundedSender<
     tokio::spawn(async move {
 
         loop {
-            
-            let terminate = status.lock().await.terminate;
-
+            let terminate = status.lock().unwrap().terminate;
             if !terminate {
-
                 match listener.accept().await {
-                    
                     Ok((mut peer, _)) => {
-                        let n_connections = status.lock().await.n_clients;
+                        let n_connections = status.lock().unwrap().n_clients;
                         if n_connections > 4 {
                             println!("Too many clients");
-                            peer.shutdown();
+                            if peer.shutdown().await.is_err() {
+                                eprintln!("Failed to shutdown a client, breaking the loop")
+                            };
 
                         } else {
 
-                            {
-                                status.lock().await.n_clients += 1;
-                            }
+                            status.lock().unwrap().n_clients += 1;
                             
                             let log_sender = tx.clone();
                             let ref_ex = existing_numbers.clone();
@@ -120,62 +99,53 @@ pub async fn start_listening(status: Arc<Mutex<AppStatus>>, tx: UnboundedSender<
                             tokio::spawn(async move {
                                 
                                 let mut reader = BufReader::new(peer.split().0);
+                                let mut line = String::new();
                                 
                                 loop {
-
-                                    let mut line = String::new();
                                     if let Ok(size) = reader.read_line(&mut line).await {
-                                        
                                         if size == 0 {
-
-                                            peer.shutdown();
-                                            ref_status.lock().await.n_clients -= 1;
+                                            if peer.shutdown().await.is_err() {
+                                                eprintln!("Failed to shutdown a client, breaking the loop")
+                                            };
+                                            ref_status.lock().unwrap().n_clients -= 1;
                                             
                                             break
                                         };
 
-                                        line = line[0..line.len() - 1].to_string();
-
-                                        match process_line(&line) {
+                                        let send_line = line.trim_end().to_string();
+                                        match process_line(&send_line) {
 
                                             PossibleOutcome::Okay(number) => {
+                                                let mut locked_ex = ref_ex.lock().unwrap();
 
-                                                let mut locked_ex = ref_ex.lock().await;
-
-                                                if locked_ex.get(&number).is_none() {
-
-                                                    ref_status.lock().await.add_unique();
+                                                if !locked_ex.contains(&number) {
+                                                    ref_status.lock().unwrap().add_unique();
                                                     locked_ex.insert(number);
-                                                    log_sender.send(number).expect("Broken pipe");
-
+                                                    log_sender.send(send_line).expect("Broken pipe");
                                                 } else {
-
-                                                    ref_status.lock().await.add_duplicate();
+                                                    ref_status.lock().unwrap().add_duplicate();
                                                 }
 
                                             },
-
                                             PossibleOutcome::Bad => {
-
-                                                peer.shutdown();
-                                                ref_status.lock().await.n_clients -= 1;
-                                                    
+                                                if peer.shutdown().await.is_err() {
+                                                    eprintln!("Failed to shutdown a client, breaking the loop")
+                                                };
+                                                ref_status.lock().unwrap().n_clients -= 1;   
                                                 break
-
                                             },
-
                                             PossibleOutcome::Terminate => {
-                                                ref_status.lock().await.terminate = true;
-
+                                                ref_status.lock().unwrap().terminate = true;
                                             }
                                         }
                                     }
-                                    if ref_status.lock().await.terminate {
-
-                                        peer.shutdown();
+                                    if ref_status.lock().unwrap().terminate {
+                                        if peer.shutdown().await.is_err() {
+                                            eprintln!("Failed to shutdown a client, breaking the loop")
+                                        };
                                         break
-                                        
                                     }
+                                    line.clear();
                                 }
                             });
                         }
@@ -194,25 +164,28 @@ pub async fn start_listening(status: Arc<Mutex<AppStatus>>, tx: UnboundedSender<
 
 }
 
-pub async fn start_logger(mut rx: UnboundedReceiver<u32>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_logger(mut rx: UnboundedReceiver<String>) -> Result<(), Box<dyn std::error::Error>> {
     
-    let log_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true) 
-        .open("numbers.log").await?;   
-
-    let mut writer = BufWriter::new(log_file);
-
-    while let Some(number) = rx.recv().await {
-
-        let mut stringed = number.to_string();
-        stringed.push_str("\n");
-        writer.write_all(stringed.as_bytes()).await;
-        writer.flush().await.expect("Failed to write to log file");
-
-    }
+    tokio::spawn(async move {
+        let Ok(log_file) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true) 
+            .open("numbers.log").await else {
+                panic!("Failed to open the file")
+            };   
+    
+        let mut writer = BufWriter::new(log_file);
+    
+        while let Some(mut number) = rx.recv().await {
+    
+            number.push_str("\n");
+            writer.write_all(number.as_bytes()).await.expect("Failed to write to buffer");
+            writer.flush().await.expect("Failed to write to log file");
+    
+        }
+    });
 
     Ok(())
 
@@ -225,9 +198,9 @@ pub async fn start_reporter(status: Arc<Mutex<AppStatus>>) -> Result<(), Box<dyn
     loop {
 
         interval.tick().await;
-        status.clone().lock().await.status_print();
+        status.clone().lock().unwrap().status_print();
 
-        if status.lock().await.terminate {
+        if status.lock().unwrap().terminate {
 
             println!("Terminated by client");
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -236,7 +209,5 @@ pub async fn start_reporter(status: Arc<Mutex<AppStatus>>) -> Result<(), Box<dyn
         } 
 
     }
-
-    Ok(())
 
 }
